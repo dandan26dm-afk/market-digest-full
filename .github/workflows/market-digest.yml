@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   digest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # גרסה קבועה, כדי שהמעבר של GitHub ל-Ubuntu 26 לא ישבור את ההרצה
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

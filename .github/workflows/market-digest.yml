@@ -3,16 +3,11 @@ name: Market Digest
 # ההפעלה היומית מגיעה מ-cron-job.org בשעה מדויקת (GitHub schedule מתעכב לפעמים בשעות).
 # אפשר גם להריץ ידנית מלשונית Actions.
 on:
-  workflow_dispatch:
-    inputs:
-      force:
-        description: "להריץ גם מחוץ לשעות (לבדיקה)"
-        type: boolean
-        default: false
-      send:
-        description: "לשלוח לדיסקורד?"
-        type: boolean
-        default: true
+    workflow_dispatch:
+  schedule:
+    - cron: "00 10 * * *"
+      timezone: "Asia/Jerusalem"
+      
 
 permissions:
   contents: read

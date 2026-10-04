@@ -381,20 +381,24 @@ def send_discord(url: str, png: Path, text: str) -> None:
 
 # ───────────────────────────── ריצה ─────────────────────────────
 
-def should_run(now: dt.datetime, schedule: str) -> bool:
-    """שני cron-ים (קיץ/חורף) — רק אחד מהם מתאים לשעון הנוכחי בניו יורק."""
+IL = ZoneInfo("Asia/Jerusalem")
+SEND_FROM = (17, 0)   # שעת שליחה, שעון ישראל
+SEND_UNTIL = (19, 30)  # אחרי זה כבר מאוחר מדי
+
+
+def should_run(now: dt.datetime) -> bool:
+    """שולחים בימי מסחר, החל מ-17:00 שעון ישראל ועד 19:30."""
     if now.weekday() >= 5:
-        print("סוף שבוע — אין מסחר")
+        print("סוף שבוע, אין מסחר")
         return False
-    if now.hour > 12 or (now.hour == 12 and now.minute > 30):
-        print(f"מאוחר מדי ({now:%H:%M %Z}): הריצה התעכבה, לא שולח תמונה של אמצע היום בשעה לא נכונה")
+    il = now.astimezone(IL)
+    t = (il.hour, il.minute)
+    if t < SEND_FROM:
+        print(f"מוקדם מדי ({il:%H:%M} שעון ישראל), מחכה להרצה הבאה")
         return False
-    if schedule:
-        is_dst = bool(now.dst())
-        summer_cron = schedule.strip().startswith("30 14")
-        if is_dst != summer_cron:
-            print(f"ה-cron '{schedule}' לא מתאים לשעון הנוכחי ({now:%H:%M %Z}) — מדלג")
-            return False
+    if t >= SEND_UNTIL:
+        print(f"מאוחר מדי ({il:%H:%M} שעון ישראל), לא שולח")
+        return False
     return True
 
 
@@ -408,7 +412,7 @@ def main() -> None:
     no_send = args.no_send or os.getenv("NO_SEND", "").lower() == "true"
 
     now = dt.datetime.now(ET)
-    if not force and not should_run(now, os.getenv("SCHEDULE", "")):
+    if not force and not should_run(now):
         return
 
     cfg = load_config()
@@ -465,6 +469,10 @@ def main() -> None:
         sys.exit("❌ חסר ה-Secret בשם DISCORD_WEBHOOK_URL ב-GitHub, ולכן התמונה לא נשלחה")
     plain_title = Markup(headline).striptags()
     send_discord(webhook, png, f"📊 **{plain_title}**")
+    out = os.getenv("GITHUB_OUTPUT")
+    if out:  # מסמן ל-GitHub שהיום כבר נשלח, כדי לא לשלוח פעמיים
+        with open(out, "a") as f:
+            f.write("sent=true\n")
 
 
 # ───────────────────────────── עיצוב התמונה (HTML) ─────────────────────────────

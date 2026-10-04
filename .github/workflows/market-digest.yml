@@ -1,13 +1,22 @@
 name: Market Digest
 
-# ההפעלה היומית מגיעה מ-cron-job.org בשעה מדויקת (GitHub schedule מתעכב לפעמים בשעות).
-# אפשר גם להריץ ידנית מלשונית Actions.
 on:
-    workflow_dispatch:
   schedule:
-    - cron: "00 10 * * *"
-      timezone: "Asia/Jerusalem"
-      
+    # שליחה יומית ב-17:00 שעון ישראל (ימים ב'-ו').
+    # GitHub עובד לפי UTC ולפעמים מאחר, לכן יש כמה ניסיונות בין 17:00 ל-17:45.
+    # הראשון שרץ שולח את התמונה, והשאר מזהים שכבר נשלח ומדלגים.
+    - cron: "0,10,20,30,45 14 * * 1-5"   # 17:00 בשעון קיץ בישראל
+    - cron: "0,10,20,30,45 15 * * 1-5"   # 17:00 בשעון חורף בישראל
+  workflow_dispatch:                     # הרצה ידנית מלשונית Actions
+    inputs:
+      force:
+        description: "להריץ גם מחוץ לשעות (לבדיקה)"
+        type: boolean
+        default: false
+      send:
+        description: "לשלוח לדיסקורד?"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -17,7 +26,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      today: ${{ steps.date.outputs.today }}
+      done: ${{ steps.sent.outputs.cache-hit }}
+    steps:
+      - name: Today (Israel)
+        id: date
+        run: echo "today=$(TZ=Asia/Jerusalem date +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Already sent today?
+        id: sent
+        if: ${{ !inputs.force }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .sent
+          key: sent-${{ steps.date.outputs.today }}
+          lookup-only: true
+
   digest:
+    needs: check
+    if: needs.check.outputs.done != 'true'
     runs-on: ubuntu-24.04   # גרסה קבועה, כדי שהמעבר של GitHub ל-Ubuntu 26 לא ישבור את ההרצה
     timeout-minutes: 15
     steps:
@@ -34,11 +64,23 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Build image & send to Discord
+        id: run
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          FORCE: ${{ inputs.force }}
-          NO_SEND: ${{ !inputs.send }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+          NO_SEND: ${{ github.event_name == 'workflow_dispatch' && !inputs.send }}
         run: python digest.py
+
+      - name: Mark today as sent
+        if: ${{ steps.run.outputs.sent == 'true' && !inputs.force }}
+        run: echo "${{ needs.check.outputs.today }}" > .sent
+
+      - name: Remember (no double send)
+        if: ${{ steps.run.outputs.sent == 'true' && !inputs.force }}
+        uses: actions/cache/save@v4
+        with:
+          path: .sent
+          key: sent-${{ needs.check.outputs.today }}
 
       - name: Save image as artifact
         if: always()

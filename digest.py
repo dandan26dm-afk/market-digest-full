@@ -327,7 +327,7 @@ def build_tiles(mkt: dict[str, Quote]) -> list[dict]:
             change, cls = f"{q.chg:+.2f}%", direction(q.chg, invert=t["kind"] == "vix")
         value_cls = ""
         if t["kind"] == "vix":
-            value_cls = "danger" if q.price >= 30 else "warn" if q.price >= 20 else ""
+            value_cls = "danger" if q.price > 30 else "warn" if q.price > 20 else ""
         tiles.append({**t, "value": fmt_price(q.price, t["kind"]), "change": change,
                       "cls": cls, "value_cls": value_cls})
     return tiles
@@ -441,8 +441,6 @@ def main() -> None:
     ups = sum(s.chg > 0 for s in stocks)
 
     ctx = {
-        "brand": cfg.get("brand", "MARKET"), "tagline": cfg.get("tagline", "Daily Market Digest"),
-        "stamp": f"{now:%B} {now.day}, {now.year} · {now.strftime('%I:%M %p').lstrip('0')} {now.tzname()}",
         "mood": mood_for(spx_chg), "headline": headline, "tone": tone,
         "story": build_story(stocks, mkt),
         "gainers": {"title": "העולות המובילות" if all(q.chg > 0 for q in top) else "החזקות ברשימה",

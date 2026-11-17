@@ -1,608 +1,560 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Market Digest — תמונת סיכום שוק יומית לדיסקורד.
+בוט "הסיפור של היום" – סיכום שוק יומי לדיסקורד.
 
-מריצים:
-    python digest.py              # מצב רגיל (כמו ב-GitHub Actions)
-    python digest.py --force      # בלי בדיקת שעה (לבדיקות)
-    python digest.py --demo       # נתוני דמו, בלי אינטרנט
-    python digest.py --no-send    # רק שומר את התמונה, לא שולח
+מושך נתונים אמיתיים מ-Yahoo Finance, בונה תמונה בעברית ושולח אותה ל-Discord.
+
+בדיקה מקומית:
+    python market_bot.py --no-send                 # נתונים אמיתיים, שומר PNG בלי לשלוח
+    python market_bot.py --demo calm --no-send     # נתוני דוגמה: calm / fear / panic
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
+import html
 import os
 import sys
 import time
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import mean
+from string import Template
 from zoneinfo import ZoneInfo
 
-import requests
-import yaml
-from jinja2 import Environment
-from markupsafe import Markup, escape
+# =====================================================================
+#                      הגדרות – כאן משנים דברים
+# =====================================================================
 
-ROOT = Path(__file__).parent
-OUT_DIR = ROOT / "out"
-ET = ZoneInfo("America/New_York")
-GENERAL = "כללי"
+SEND_HOUR_IL = 17           # שעת השליחה בשעון ישראל
+SEND_MINUTE_IL = 0
+MAX_LATE_HOURS = 3          # אם GitHub איחר יותר מזה – לא שולחים באותו יום
 
-# המשבצות בחלק התחתון (שתי שורות של 4)
-MARKET_TILES = [
-    {"symbol": "^GSPC", "label": "S&P 500", "sub": "", "kind": "index"},
-    {"symbol": "QQQ", "label": "QQQ", "sub": "", "kind": "price"},
-    {"symbol": "^VIX", "label": "VIX", "sub": "", "kind": "vix"},
-    {"symbol": "^RUT", "label": "RUSSELL", "sub": "", "kind": "index"},
-    {"symbol": "RSP", "label": "RSP", "sub": "שוויוני", "kind": "price"},
-    {"symbol": "BTC-USD", "label": "BTCUSD", "sub": "", "kind": "crypto"},
-    {"symbol": "CL=F", "label": "USOIL", "sub": "", "kind": "price"},
-    {"symbol": "^TNX", "label": "US10Y", "sub": "", "kind": "yield"},
+# חייב להתאים בדיוק לשורות ה-cron בקובץ .github/workflows/market-summary.yml
+CRON_SUMMER = "20 13 * * 1-5"   # שעון קיץ בישראל (UTC+3) → מתעורר ב-16:20
+CRON_WINTER = "20 14 * * 1-5"   # שעון חורף בישראל (UTC+2) → מתעורר ב-16:20
+
+# הרשימה שלך: טיקר → תגית קטנה שמופיעה ליד השם ("" = בלי תגית)
+WATCHLIST = {
+    "NVDA": "שבבים",
+    "PLTR": "תוכנה",
+    "IGV": "תוכנה",
+    "GEV": "אנרגיה",
+    "MAGS": "מגה-קאפ",
+    "SOXX": "שבבים",
+    "AAPL": "מגה-קאפ",
+    "GOOGL": "מגה-קאפ",
+    "NOW": "תוכנה",
+    "AMZN": "מגה-קאפ",
+    "TSLA": "מגה-קאפ",
+    "META": "מגה-קאפ",
+    "MSFT": "מגה-קאפ",
+    "AVGO": "שבבים",
+    "AMD": "שבבים",
+    "SPCX": "",
+    "WGMI": "כורי ביטקוין",
+}
+TOP_N = 5   # כמה מניות בכל צד
+
+# תעודות הסל של הסקטורים (SPDR): טיקר → שם בעברית
+# מוצגות בחלק העליון, ממוינות מהחזקה לחלשה
+SECTORS = {
+    "XLK": "טכנולוגיה",
+    "XLC": "תקשורת",
+    "XLY": "צריכה מחזורית",
+    "XLF": "פיננסים",
+    "XLV": "בריאות",
+    "XLI": "תעשייה",
+    "XLE": "אנרגיה",
+    "XLB": "חומרים",
+    "XLP": "צריכה בסיסית",
+    "XLU": "תשתיות",
+    "XLRE": 'נדל"ן',
+}
+
+# החלק התחתון: (שם שמוצג, סימול ב-Yahoo, סוג תצוגה, תגית)
+#   index = מספר שלם מעל 1000 / usd = עם $ / yield = תשואה ב-% ושינוי ב-bps
+MACRO = [
+    ("S&P 500", "^GSPC", "index", ""),
+    ("QQQ", "QQQ", "price", ""),
+    ("VIX", "^VIX", "index", ""),
+    ("RUSSELL", "^RUT", "index", ""),
+    ("RSP", "RSP", "price", "שוויוני"),
+    ("BTCUSD", "BTC-USD", "usd", ""),
+    ("USOIL", "CL=F", "price", ""),      # נפט WTI (חוזה עתידי)
+    ("US10Y", "^TNX", "yield", ""),      # תשואת אג"ח 10 שנים
 ]
 
-# צבע רקע לפי ה-S&P 500
-MOODS = [  # (סף מינימלי, שם)
-    (1.0, "strong-up"),
-    (0.25, "up"),
-    (-0.25, "flat"),
-    (-1.0, "down"),
-    (float("-inf"), "strong-down"),
-]
+# סימולים שנסחרים 24/7 או בחוזים – לא בודקים להם "האם יש נתון של היום"
+NON_US_SESSION = {"BTC-USD", "CL=F"}
+
+# ספי ה-VIX
+VIX_FEAR = 20           # רמה מעל 20 → "סטטיסטיקה לטובתנו"
+VIX_PANIC = 30          # רמה מעל 30 → "קנייה גם כשמגעיל"
+VIX_SPIKE_PCT = 30      # קפיצה יומית של 30% ומעלה → "סימן קנייה" (גובר על השאר)
+
+# מתחת לשינוי הזה (באחוזים, לכל כיוון) ה-S&P נחשב "ללא שינוי" → רקע אפור-כחלחל
+FLAT_BAND = 0.20
+
+# =====================================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+IL = ZoneInfo("Asia/Jerusalem")
+NY = ZoneInfo("America/New_York")
 
 
 @dataclass
 class Quote:
     symbol: str
-    price: float
-    prev: float
-    group: str = GENERAL
+    price: float | None
+    prev: float | None
+    last_date: dt.date | None = None
 
     @property
-    def chg(self) -> float:
-        return (self.price / self.prev - 1) * 100 if self.prev else 0.0
+    def pct(self) -> float | None:
+        if self.price is None or not self.prev:
+            return None
+        return (self.price / self.prev - 1) * 100
 
 
-# ───────────────────────────── נתונים ─────────────────────────────
+# ---------------------------------------------------------------------
+#  תזמון
+# ---------------------------------------------------------------------
 
-def load_config() -> dict:
-    cfg = yaml.safe_load((ROOT / "watchlist.yaml").read_text(encoding="utf-8"))
-    groups = cfg.get("groups") or {}
-    watch: dict[str, str] = {}
-    for group, tickers in groups.items():
-        for t in tickers or []:
-            watch[str(t).strip().upper()] = str(group)
-    for t in cfg.get("tickers") or []:  # רשימה שטוחה (אופציונלי)
-        watch.setdefault(str(t).strip().upper(), GENERAL)
-    if not watch:
-        sys.exit("watchlist.yaml ריק — צריך להוסיף לפחות מניה אחת")
-    cfg["watch"] = watch
-    return cfg
+def expected_cron(now_utc: dt.datetime) -> str:
+    offset_h = now_utc.astimezone(IL).utcoffset().total_seconds() / 3600
+    return CRON_SUMMER if offset_h >= 3 else CRON_WINTER
 
 
-def fetch_quotes(symbols: list[str], today: dt.date) -> tuple[dict[str, Quote], dt.date]:
-    """מוריד נתונים יומיים מ-Yahoo. בשעות המסחר, הנר של היום = המחיר הנוכחי."""
-    import pandas as pd
-    import yfinance as yf
-
-    data = None
-    for attempt in range(3):
-        try:
-            data = yf.download(
-                symbols, period="10d", interval="1d", group_by="ticker",
-                auto_adjust=False, progress=False, threads=True,
-            )
-            if data is not None and not data.empty:
-                break
-        except Exception as e:  # yfinance לפעמים נחסם זמנית
-            print(f"ניסיון {attempt + 1} נכשל: {e}")
-        time.sleep(15)
-    if data is None or data.empty:
-        sys.exit("לא התקבלו נתונים מ-Yahoo Finance")
-
-    def closes(sym: str) -> "pd.Series":
-        try:
-            s = data[sym]["Close"] if isinstance(data.columns, pd.MultiIndex) else data["Close"]
-        except KeyError:
-            return pd.Series(dtype=float)
-        s = s.dropna()
-        s.index = [d.date() for d in pd.to_datetime(s.index)]
-        return s
-
-    spx = closes("^GSPC")
-    if spx.empty:
-        sys.exit("אין נתונים ל-S&P 500")
-    session = max(spx.index)  # יום המסחר האחרון (היום, אם הבורסה פתוחה)
-
-    quotes: dict[str, Quote] = {}
-    for sym in symbols:
-        s = closes(sym)
-        before = s[[d < session for d in s.index]]
-        if s.empty or before.empty:
-            print(f"⚠️  אין מספיק נתונים ל-{sym}, מדלג")
-            continue
-        on_session = s[[d == session for d in s.index]]
-        if on_session.empty:
-            print(f"⚠️  אין מחיר עדכני ל-{sym} ליום {session}, מדלג (לא מציג נתון ישן)")
-            continue
-        quotes[sym] = Quote(sym, float(on_session.iloc[-1]), float(before.iloc[-1]))
-
-    # יומן אימות: כל מחיר שנכנס לתמונה, כדי שאפשר יהיה להשוות מול Yahoo
-    print(f"\nנתונים מ-Yahoo Finance ליום {session}:")
-    print(f"{'SYMBOL':<9}{'PREV CLOSE':>12}{'NOW':>12}{'CHANGE':>9}")
-    for q in quotes.values():
-        print(f"{q.symbol:<9}{q.prev:>12,.2f}{q.price:>12,.2f}{q.chg:>+8.2f}%")
-    print()
-    return quotes, session
+def gate() -> bool:
+    """GitHub מריץ שתי שורות cron (קיץ/חורף). רק אחת מהן מתאימה להיום."""
+    sched = os.environ.get("TRIGGER_SCHEDULE", "").strip()
+    if not sched:
+        print("הרצה ידנית – ממשיכים מיד.")
+        return True
+    exp = expected_cron(dt.datetime.now(dt.timezone.utc))
+    if sched == exp:
+        print(f"ה-cron '{sched}' מתאים לשעון הנוכחי בישראל – ממשיכים.")
+        return True
+    print(f"ה-cron '{sched}' לא מתאים לעונה הנוכחית (מצופה '{exp}') – מדלגים.")
+    return False
 
 
-def demo_quotes() -> dict[str, Quote]:
-    rows = {
-        "NVDA": (212.5, 3.9), "AVGO": (402.1, 2.8), "AMD": (188.0, 4.6), "SOXX": (290.3, 3.1),
-        "AAPL": (241.0, 0.4), "GOOGL": (228.0, 1.2), "AMZN": (238.0, 0.6), "META": (744.0, -1.1),
-        "MSFT": (512.0, -0.8), "TSLA": (402.0, 2.2), "MAGS": (61.2, 0.9),
-        "PLTR": (171.0, -4.1), "NOW": (880.3, -2.9), "IGV": (108.4, -1.9),
-        "GEV": (655.0, 1.7), "SPCX": (148.7, -2.4), "WGMI": (31.4, 5.8),
-        "^GSPC": (7292, 0.35), "QQQ": (612.4, 0.56), "^VIX": (21.93, -1.31), "^RUT": (2875, 1.39),
-        "RSP": (192.4, 0.92), "BTC-USD": (118420, -3.4), "CL=F": (71.35, 2.4),
-    }
-    q = {s: Quote(s, p, p / (1 + c / 100)) for s, (p, c) in rows.items()}
-    q["^TNX"] = Quote("^TNX", 4.31, 4.24)
-    return q
-
-
-# ───────────────────────────── טקסט בעברית ─────────────────────────────
-
-def tk(sym: str) -> Markup:
-    """סימול/מספר בכיוון LTR בתוך טקסט עברי."""
-    return Markup('<bdi class="tk">{}</bdi>').format(sym)
-
-
-def pct(x: float, sign: bool = False) -> Markup:
-    return tk(f"{x:+.2f}%" if sign else f"{abs(x):.2f}%")
-
-
-def verb_plural(c: float) -> str:  # "מניות X ..."
-    if c >= 4: return "זינקו"
-    if c >= 1.5: return "מטפסות"
-    if c > 0: return "מתחזקות"
-    if c <= -4: return "צנחו"
-    if c <= -1.5: return "יורדות"
-    return "נחלשות"
-
-
-def verb_single(c: float) -> str:  # "X מזנקת ..."
-    if c >= 4: return "מזנקת"
-    if c >= 1.5: return "מטפסת"
-    if c >= 0: return "עולה"
-    if c <= -4: return "צונחת"
-    if c <= -1.5: return "יורדת"
-    return "נחלשת"
-
-
-def verb_masc(c: float) -> str:  # ביטקוין / נפט / מדד
-    if c >= 4: return "מזנק"
-    if c >= 0: return "עולה"
-    if c <= -4: return "צונח"
-    return "יורד"
-
-
-def build_headline(stocks: list[Quote]) -> tuple[Markup, str]:
-    ups = sorted([s for s in stocks if s.chg > 0], key=lambda s: -s.chg)
-    downs = sorted([s for s in stocks if s.chg < 0], key=lambda s: s.chg)
-    if not ups and not downs:
-        return Markup("שעת המסחר הראשונה: הרשימה ללא שינוי"), "flat"
-
-    focus_up = bool(ups) and (not downs or ups[0].chg >= abs(downs[0].chg))
-    movers = ups if focus_up else downs
-    tone = "up" if focus_up else "down"
-    lead = movers[0]
-    hl = lambda text: Markup('<span class="hl">{}</span>').format(text)
-
-    if lead.group != GENERAL:
-        same = [s for s in movers if s.group == lead.group]
-        if len(same) >= 2:
-            avg = mean(s.chg for s in same[:3])
-            return (Markup("מניות ") + hl(lead.group) + " " + verb_plural(avg)
-                    + " בהובלת " + tk(same[0].symbol) + " ו-" + tk(same[1].symbol)), tone
-
-    if len(movers) >= 2 and abs(movers[1].chg) >= 0.6 * abs(lead.chg):
-        word = "העליות" if focus_up else "הירידות"
-        return (tk(lead.symbol) + " ו-" + tk(movers[1].symbol) + " מובילות את " + hl(word)), tone
-
-    return tk(lead.symbol) + " " + hl(verb_single(lead.chg)) + " ב-" + pct(lead.chg), tone
-
-
-def build_story(stocks: list[Quote], mkt: dict[str, Quote]) -> Markup:
-    parts: list[Markup] = []
-    ups = sorted([s for s in stocks if s.chg > 0], key=lambda s: -s.chg)
-    downs = sorted([s for s in stocks if s.chg < 0], key=lambda s: s.chg)
-
-    # 1. מצב השוק
-    spx, ndx = mkt.get("^GSPC"), mkt.get("QQQ")
-    if spx and ndx:
-        w = lambda c: "עולה" if c >= 0 else "יורד"
-        if (spx.chg >= 0) == (ndx.chg >= 0):
-            direction = "בעליות" if spx.chg >= 0 else "בירידות"
-            parts.append(Markup("וול סטריט נסחרת {}: ה-{} {} ב-{} והנאסד״ק ב-{}.").format(
-                direction, tk("S&P 500"), w(spx.chg), pct(spx.chg), pct(ndx.chg)))
-        else:
-            parts.append(Markup("וול סטריט נסחרת במגמה מעורבת: ה-{} {} ב-{} והנאסד״ק {} ב-{}.").format(
-                tk("S&P 500"), w(spx.chg), pct(spx.chg), w(ndx.chg), pct(ndx.chg)))
-
-    # 2. המובילות
-    if ups:
-        s = Markup("בראש הרשימה {} עם עלייה של {}").format(tk(ups[0].symbol), pct(ups[0].chg))
-        rest = [Markup("{} ({})").format(tk(q.symbol), pct(q.chg, sign=True)) for q in ups[1:3]]
-        if rest:
-            s += Markup(", ואחריה ") + Markup(" ו-").join(rest)
-        parts.append(s + ".")
-    elif downs:
-        parts.append(Markup("כל המניות ברשימה נסחרות היום בירידות."))
-    else:
-        parts.append(Markup("המניות ברשימה נסחרות ללא שינוי מהותי."))
-
-    # 3. החלשות
-    if downs:
-        opener = "מנגד," if ups else "בראש הירידות"
-        s = Markup("{} {} {} ב-{}").format(opener, tk(downs[0].symbol), verb_single(downs[0].chg), pct(downs[0].chg))
-        if len(downs) >= 2:
-            s += Markup(" ו-{} ב-{}").format(tk(downs[1].symbol), pct(downs[1].chg))
-        parts.append(s + ".")
-    elif ups:
-        parts.append(Markup("כל המניות ברשימה נסחרות היום בעליות."))
-
-    # 4. רוחב שוק (RSP מול S&P)
-    rsp = mkt.get("RSP")
-    if rsp and spx:
-        d = rsp.chg - spx.chg
-        if d >= 0.4:
-            parts.append(Markup("רוחב השוק חיובי: ה-{} השוויוני ({}) מקדים את המדד המשוקלל בכ-{}.").format(
-                tk("S&P"), tk("RSP"), pct(d)))
-        elif d <= -0.4:
-            parts.append(Markup("המדד נשען על הענקיות: ה-{} השוויוני ({}) מפגר אחרי המדד המשוקלל בכ-{}.").format(
-                tk("S&P"), tk("RSP"), pct(d)))
-
-    # 5. רוטציה בין קבוצות
-    by_group: dict[str, list[float]] = {}
-    for s in stocks:
-        if s.group != GENERAL:
-            by_group.setdefault(s.group, []).append(s.chg)
-    avgs = {g: mean(v) for g, v in by_group.items() if len(v) >= 2}
-    if len(avgs) >= 2:
-        best = max(avgs, key=avgs.get)
-        worst = min(avgs, key=avgs.get)
-        if avgs[best] >= 1 and avgs[worst] <= -1:
-            parts.append(Markup("המגמה מעידה על מעבר ממניות {} אל מניות {}.").format(worst, best))
-
-    # 6. מאקרו — רק כשיש תנועה משמעותית
-    btc, oil, tnx = mkt.get("BTC-USD"), mkt.get("CL=F"), mkt.get("^TNX")
-    if btc and abs(btc.chg) >= 3:
-        parts.append(Markup("הביטקוין {} ב-{}.").format(verb_masc(btc.chg), pct(btc.chg)))
-    if oil and abs(oil.chg) >= 2:
-        parts.append(Markup("הנפט {} ב-{}.").format(verb_masc(oil.chg), pct(oil.chg)))
-    if tnx and abs(tnx.price - tnx.prev) * 100 >= 5:
-        parts.append(Markup("תשואת האג״ח ל-10 שנים {} ל-{}.").format(
-            "עולה" if tnx.price > tnx.prev else "יורדת", tk(f"{tnx.price:.2f}%")))
-
-    return Markup(" ").join(parts[:6])  # לא יותר מ-6 משפטים
-
-
-# ───────────────────────────── עיצוב ─────────────────────────────
-
-def mood_for(spx_chg: float) -> str:
-    for threshold, name in MOODS:
-        if spx_chg >= threshold:
-            return name
-    return "flat"
-
-
-def direction(c: float, invert: bool = False) -> str:
-    if abs(c) < 0.005:
-        return "flat"
-    up = c > 0
-    return "up" if up != invert else "down"
-
-
-def fmt_price(v: float, kind: str) -> str:
-    if kind == "yield":
-        return f"{v:.2f}%"
-    if kind == "crypto":
-        return f"${v:,.0f}"
-    return f"{v:,.0f}" if v >= 1000 else f"{v:,.2f}"
-
-
-def build_tiles(mkt: dict[str, Quote]) -> list[dict]:
-    tiles = []
-    for t in MARKET_TILES:
-        q = mkt.get(t["symbol"])
-        if not q:
-            continue
-        if t["kind"] == "yield":
-            bps = (q.price - q.prev) * 100
-            change, cls = f"{bps:+.0f} bps", direction(bps)
-        else:
-            change, cls = f"{q.chg:+.2f}%", direction(q.chg, invert=t["kind"] == "vix")
-        value_cls = ""
-        if t["kind"] == "vix":
-            value_cls = "danger" if q.price > 30 else "warn" if q.price > 20 else ""
-        tiles.append({**t, "value": fmt_price(q.price, t["kind"]), "change": change,
-                      "cls": cls, "value_cls": value_cls})
-    return tiles
-
-
-def vix_alert(mkt: dict[str, Quote]) -> dict | None:
-    """הודעת VIX: שורה ראשונה = כותרת, השאר = שורות משנה."""
-    vix = mkt.get("^VIX")
-    if not vix:
-        return None
-    if vix.price > 30:
-        return {"level": "danger", "title": "Vix > 30",
-                "lines": ["קנייה🛒🛒🛒", "קנייה גם כשמגעיל"]}
-    if vix.price > 20:
-        return {"level": "warn", "title": "Vix > 20 🛒",
-                "lines": ["סטטיסטיקה לטובתנו 🛒"]}
-    return {"level": "calm", "title": "",
-            "lines": [Markup("רמת {} ב-{}: השוק רגוע יחסית").format(tk("VIX"), tk(f"{vix.price:.2f}"))]}
-
-
-def stock_rows(quotes: list[Quote]) -> list[dict]:
-    return [{"symbol": q.symbol, "change": f"{q.chg:+.2f}%", "cls": direction(q.chg),
-             "group": "" if q.group == GENERAL else q.group, "price": fmt_price(q.price, "price")}
-            for q in quotes]
-
-
-def render_html(ctx: dict) -> str:
-    # העיצוב נמצא בתוך הקובץ הזה (TEMPLATE למטה), אין צורך בקובץ נפרד
-    env = Environment(autoescape=True)
-    return env.from_string(TEMPLATE).render(**ctx)
-
-
-def html_to_png(html: str, out: Path) -> None:
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(viewport={"width": 1080, "height": 1350}, device_scale_factor=1)
-        page.set_content(html, wait_until="networkidle", timeout=30000)
-        page.evaluate("() => document.fonts.ready.then(() => true)")
-        page.locator("#card").screenshot(path=str(out))
-        browser.close()
-
-
-def send_discord(url: str, png: Path, text: str) -> None:
-    with png.open("rb") as f:
-        r = requests.post(url, data={"payload_json": json.dumps({"content": text})},
-                          files={"files[0]": (png.name, f, "image/png")}, timeout=30)
-    r.raise_for_status()
-    print("✅ נשלח לדיסקורד")
-
-
-# ───────────────────────────── ריצה ─────────────────────────────
-
-IL = ZoneInfo("Asia/Jerusalem")
-SEND_FROM = (17, 0)   # שעת שליחה, שעון ישראל
-SEND_UNTIL = (19, 30)  # אחרי זה כבר מאוחר מדי
-
-
-def should_run(now: dt.datetime) -> bool:
-    """שולחים בימי מסחר, החל מ-17:00 שעון ישראל ועד 19:30."""
-    if now.weekday() >= 5:
-        print("סוף שבוע, אין מסחר")
+def wait_until_send_time() -> bool:
+    now = dt.datetime.now(IL)
+    target = now.replace(hour=SEND_HOUR_IL, minute=SEND_MINUTE_IL, second=0, microsecond=0)
+    if now < target:
+        secs = (target - now).total_seconds()
+        print(f"ממתינים {secs / 60:.1f} דקות עד {target:%H:%M} שעון ישראל...")
+        time.sleep(secs)
+        return True
+    late_h = (now - target).total_seconds() / 3600
+    if late_h > MAX_LATE_HOURS:
+        print(f"GitHub איחר ב-{late_h:.1f} שעות – לא שולחים היום.")
         return False
-    il = now.astimezone(IL)
-    t = (il.hour, il.minute)
-    if t < SEND_FROM:
-        print(f"מוקדם מדי ({il:%H:%M} שעון ישראל), מחכה להרצה הבאה")
-        return False
-    if t >= SEND_UNTIL:
-        print(f"מאוחר מדי ({il:%H:%M} שעון ישראל), לא שולח")
-        return False
+    if late_h > 0.02:
+        print(f"GitHub איחר ב-{late_h * 60:.0f} דקות – שולחים עכשיו.")
     return True
 
 
+# ---------------------------------------------------------------------
+#  נתונים מ-Yahoo Finance
+# ---------------------------------------------------------------------
+
+def _quote_from_frame(sym: str, frame) -> Quote | None:
+    if frame is None or getattr(frame, "empty", True) or "Close" not in frame:
+        return None
+    closes = frame["Close"].dropna()
+    if len(closes) < 2:
+        return None
+    return Quote(sym, float(closes.iloc[-1]), float(closes.iloc[-2]), closes.index[-1].date())
+
+
+def _single_quote(sym: str) -> Quote | None:
+    import yfinance as yf
+    for attempt in range(3):
+        try:
+            hist = yf.Ticker(sym).history(period="10d", interval="1d", auto_adjust=False)
+            q = _quote_from_frame(sym, hist)
+            if q:
+                return q
+        except Exception as e:
+            print(f"  {sym}: ניסיון {attempt + 1} נכשל ({e})")
+        time.sleep(3 * (attempt + 1))
+    return None
+
+
+def fetch_quotes(symbols: list[str]) -> dict[str, Quote]:
+    """מחיר אחרון (כולל המסחר של היום) + סגירה קודמת, לכל סימול."""
+    import yfinance as yf
+    frame = None
+    for attempt in range(3):
+        try:
+            frame = yf.download(symbols, period="10d", interval="1d", group_by="ticker",
+                                auto_adjust=False, progress=False, threads=True)
+            if frame is not None and not frame.empty:
+                break
+        except Exception as e:
+            print(f"הורדה מרוכזת נכשלה (ניסיון {attempt + 1}): {e}")
+        time.sleep(5 * (attempt + 1))
+
+    quotes: dict[str, Quote] = {}
+    for sym in symbols:
+        q = None
+        try:
+            if frame is not None and sym in frame.columns.get_level_values(0):
+                q = _quote_from_frame(sym, frame[sym])
+        except Exception:
+            q = None
+        if q is None:
+            print(f"  {sym}: מנסים שוב בנפרד...")
+            q = _single_quote(sym)
+        if q is None:
+            print(f"  ⚠️ {sym}: אין נתונים – לא יוצג.")
+            continue
+        quotes[sym] = q
+    return quotes
+
+
+def drop_stale(quotes: dict[str, Quote], today_ny: dt.date) -> None:
+    """מניה שאין לה עדיין נתון של היום – לא מציגים לה שינוי (כדי לא להציג את אתמול)."""
+    for sym, q in quotes.items():
+        if sym in NON_US_SESSION:
+            continue
+        if q.last_date != today_ny:
+            print(f"  ⚠️ {sym}: הנתון האחרון מ-{q.last_date} ולא מהיום – השינוי לא יוצג.")
+            q.prev = None
+
+
+# ---------------------------------------------------------------------
+#  בניית התמונה
+# ---------------------------------------------------------------------
+
+def cls(p: float | None, invert: bool = False) -> str:
+    if p is None or abs(p) < 0.005:
+        return "flat"
+    up = p > 0
+    return ("down" if up else "up") if invert else ("up" if up else "down")
+
+
+def fmt_pct(p: float | None) -> str:
+    return "—" if p is None else f"{p:+.2f}%"
+
+
+def fmt_value(v: float, kind: str) -> str:
+    if kind == "usd":
+        return f"${v:,.0f}"
+    if kind == "yield":
+        return f"{v:.2f}%"
+    if kind == "index" and v >= 1000:
+        return f"{v:,.0f}"
+    return f"{v:,.2f}"
+
+
+def num(text: str) -> str:
+    return f'<span class="num">{html.escape(text)}</span>'
+
+
+def mover_rows(items: list[tuple[str, float]]) -> str:
+    rows = []
+    for sym, p in items:
+        tag = WATCHLIST.get(sym, "")
+        tag_html = f'<span class="tag">{html.escape(tag)}</span>' if tag else ""
+        rows.append(
+            f'<div class="row"><div><span class="sym">{sym}</span>{tag_html}</div>'
+            f'<div class="pct {cls(p)}">{fmt_pct(p)}</div></div>'
+        )
+    return "\n".join(rows)
+
+
+def build_title(ranked: list[tuple[str, float]], spx_pct: float | None) -> str:
+    gainers = [s for s, p in ranked if p > 0][:2]
+    losers = [s for s, p in reversed(ranked) if p < 0][:2]
+    market_up = spx_pct is None or spx_pct >= 0
+    if market_up and gainers:
+        names, word, c = gainers, "העליות", "up"
+    elif losers:
+        names, word, c = losers, "הירידות", "down"
+    elif gainers:
+        names, word, c = gainers, "העליות", "up"
+    else:
+        return "השוק נסחר ללא כיוון ברור"
+    verb = "מובילה" if len(names) == 1 else "מובילות"
+    return f'{" ו-".join(names)} {verb} את <span class="{c}">{word}</span>'
+
+
+def sector_tiles(quotes: dict[str, Quote]) -> tuple[str, str]:
+    """אריחי הסקטורים, ממוינים מהחזק לחלש. רקע האריח מתחזק ככל שהתנועה גדולה יותר."""
+    items = [(s, quotes[s].pct) for s in SECTORS if s in quotes]
+    items.sort(key=lambda x: (x[1] is None, -(x[1] or 0)))
+    tiles = []
+    for sym, p in items:
+        if p is None:
+            bg = "rgba(255,255,255,.03)"
+        else:
+            alpha = 0.06 + 0.32 * min(abs(p) / 3.0, 1.0)     # 3% ומעלה = הכי כהה
+            rgb = "74,222,128" if p > 0 else "242,100,100"
+            bg = f"rgba({rgb},{alpha:.2f})"
+        tiles.append(
+            f'<div class="sec" style="background:{bg}">'
+            f'<div class="sec-sym">{sym}</div>'
+            f'<div class="sec-name">{html.escape(SECTORS[sym])}</div>'
+            f'<div class="sec-pct {cls(p)}">{fmt_pct(p)}</div></div>'
+        )
+    known = [p for _, p in items if p is not None]
+    ups = sum(1 for p in known if p > 0)
+    summary = f"עולים: {num(f'{ups}/{len(known)}')}" if known else ""
+    return "\n".join(tiles), summary
+
+
+def vix_banner(vix: Quote | None) -> str:
+    if not vix or vix.price is None:
+        return ""
+    v, chg = vix.price, vix.pct
+
+    # קפיצה חדה ביום אחד – סימן קנייה, גובר על כל השאר
+    if chg is not None and chg >= VIX_SPIKE_PCT:
+        if v > VIX_PANIC:
+            extra = "Vix &gt; 30 · קנייה גם כשמגעיל"
+        elif v > VIX_FEAR:
+            extra = "Vix &gt; 20 · סטטיסטיקה לטובתנו"
+        else:
+            extra = f"רמת VIX ב-{num(f'{v:.2f}')}"
+        return ('<div class="vix spike">'
+                '<div class="l1">✅ סימן קנייה</div>'
+                f'<div class="l2">ה-VIX זינק היום ב-{num(f"+{chg:.1f}%")} 🛒</div>'
+                f'<div class="l3">{extra}</div></div>')
+
+    if v > VIX_PANIC:
+        return ('<div class="vix panic"><div class="l1" dir="ltr">Vix &gt; 30</div>'
+                '<div class="l2">קנייה🛒🛒🛒</div><div class="l3">קנייה גם כשמגעיל</div></div>')
+    if v > VIX_FEAR:
+        return ('<div class="vix fear"><div class="l1" dir="ltr">Vix &gt; 20 🛒</div>'
+                '<div class="l2">סטטיסטיקה לטובתנו 🛒</div></div>')
+    return f'<div class="vix calm">רמת VIX ב-{num(f"{v:.2f}")}: השוק רגוע יחסית</div>'
+
+
+def macro_tiles(quotes: dict[str, Quote]) -> str:
+    tiles = []
+    for label, sym, kind, tag in MACRO:
+        q = quotes.get(sym)
+        if not q or q.price is None:
+            val, chg, c = "—", "—", "flat"
+        else:
+            price, prev = q.price, q.prev
+            if kind == "yield" and price > 20:          # ליתר ביטחון: אם Yahoo מחזיר פי 10
+                price, prev = price / 10, (prev / 10 if prev else prev)
+            val = fmt_value(price, kind)
+            if kind == "yield":
+                bps = None if not prev else (price - prev) * 100
+                chg = "—" if bps is None else f"{bps:+.0f} bps"
+                c = cls(bps)
+            else:
+                chg = fmt_pct(q.pct)
+                c = cls(q.pct, invert=(sym == "^VIX"))   # VIX יורד = טוב → ירוק
+        tag_html = f'<span class="t-tag">{html.escape(tag)}</span>' if tag else ""
+        tiles.append(
+            f'<div class="tile"><div class="t-label"><span>{html.escape(label)}</span>{tag_html}</div>'
+            f'<div class="t-val">{html.escape(val)}</div>'
+            f'<div class="t-chg {c}">{html.escape(chg)}</div></div>'
+        )
+    return "\n".join(tiles)
+
+
+def font_css() -> str:
+    local = BASE_DIR / "fonts" / "Heebo.ttf"
+    if local.exists():
+        import base64
+        b64 = base64.b64encode(local.read_bytes()).decode()
+        return ("<style>@font-face{font-family:'Heebo';font-weight:100 900;"
+                f"src:url(data:font/ttf;base64,{b64}) format('truetype');}}</style>")
+    return ('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+            'family=Heebo:wght@400;500;700;800;900&display=swap">')
+
+
+def build_html(quotes: dict[str, Quote]) -> str:
+    ranked = sorted(
+        [(s, quotes[s].pct) for s in WATCHLIST if s in quotes and quotes[s].pct is not None],
+        key=lambda x: x[1], reverse=True,
+    )
+    top = ranked[:TOP_N]
+    bottom = sorted(ranked, key=lambda x: x[1])[:TOP_N]
+    ups = sum(1 for _, p in ranked if p > 0)
+
+    spx = quotes.get("^GSPC")
+    spx_pct = spx.pct if spx else None
+    mood = ("flat" if spx_pct is None or abs(spx_pct) < FLAT_BAND
+            else "up" if spx_pct > 0 else "down")
+
+    all_pos = top and all(p >= 0 for _, p in top)
+    all_neg = bottom and all(p < 0 for _, p in bottom)
+    sectors_html, sectors_summary = sector_tiles(quotes)
+
+    tpl = Template((BASE_DIR / "template.html").read_text(encoding="utf-8"))
+    return tpl.safe_substitute(
+        font_css=font_css(),
+        mood=mood,
+        up_count=f"{ups}/{len(ranked)}",
+        title_html=build_title(ranked, spx_pct),
+        sectors_html=sectors_html,
+        sectors_summary=sectors_summary,
+        gainers_title="העולות המובילות" if all_pos else "החזקות ברשימה",
+        losers_title="היורדות המובילות" if all_neg else "החלשות ברשימה",
+        gainers_rows=mover_rows(top),
+        losers_rows=mover_rows(bottom),
+        vix_html=vix_banner(quotes.get("^VIX")),
+        tiles_html=macro_tiles(quotes),
+    )
+
+
+def render_png(html_str: str, out_path: Path) -> None:
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 980, "height": 1300}, device_scale_factor=2)
+        try:
+            page.set_content(html_str, wait_until="networkidle", timeout=30000)
+        except Exception:
+            page.set_content(html_str, wait_until="load")
+        page.evaluate("document.fonts.ready")
+        page.wait_for_timeout(300)
+        page.locator("#card").screenshot(path=str(out_path))
+        browser.close()
+    print(f"התמונה נשמרה: {out_path}")
+
+
+# ---------------------------------------------------------------------
+#  שליחה לדיסקורד
+# ---------------------------------------------------------------------
+
+def send_to_discord(png: Path) -> None:
+    import requests
+    url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    if not url:
+        sys.exit("❌ חסר DISCORD_WEBHOOK_URL (צריך להגדיר אותו ב-GitHub Secrets).")
+    for attempt in range(4):
+        with open(png, "rb") as f:
+            r = requests.post(
+                url,
+                files={"files[0]": ("market_summary.png", f, "image/png")},
+                timeout=60,
+            )
+        if r.ok:
+            print("✅ נשלח לדיסקורד.")
+            return
+        if r.status_code == 429:
+            wait = float(r.json().get("retry_after", 2))
+            print(f"דיסקורד ביקש להמתין {wait} שניות...")
+            time.sleep(wait + 0.5)
+            continue
+        print(f"שגיאה מדיסקורד {r.status_code}: {r.text[:300]}")
+        time.sleep(3)
+    sys.exit("❌ השליחה לדיסקורד נכשלה.")
+
+
+# ---------------------------------------------------------------------
+#  נתוני דוגמה (לתצוגה מקדימה בלבד)
+# ---------------------------------------------------------------------
+
+DEMO = {
+    "calm": {
+        "watch": {"SPCX": 7.35, "TSLA": 4.65, "AVGO": 3.35, "AMD": 2.95, "SOXX": 2.18,
+                  "NVDA": 1.92, "WGMI": 1.74, "MAGS": 1.21, "AMZN": 1.05, "GOOGL": 0.88,
+                  "AAPL": 0.64, "MSFT": 0.47, "META": 0.30, "IGV": 0.18, "GEV": 0.13,
+                  "PLTR": -0.68, "NOW": -2.45},
+        "sectors": {"XLK": 1.42, "XLC": 0.95, "XLY": 1.18, "XLF": 0.61, "XLV": -0.22,
+                    "XLI": 0.48, "XLE": -0.87, "XLB": 0.31, "XLP": -0.35, "XLU": -0.51,
+                    "XLRE": 0.12},
+        "macro": {"^GSPC": (7723, 0.73), "QQQ": (749.58, 1.02), "^VIX": (15.31, -6.59),
+                  "^RUT": (2833, 0.94), "RSP": (209.73, 0.35), "BTC-USD": (84497, -0.42),
+                  "CL=F": (91.11, -1.90), "^TNX": (5.28, None)},
+        "tnx_prev": 5.24,
+    },
+    "fear": {
+        "watch": {"GEV": 1.12, "WGMI": 0.42, "AAPL": -0.31, "MSFT": -0.58, "GOOGL": -0.74,
+                  "META": -0.96, "AMZN": -1.10, "MAGS": -1.24, "IGV": -1.40, "NOW": -1.66,
+                  "AVGO": -1.83, "SOXX": -2.05, "NVDA": -2.31, "TSLA": -2.64, "AMD": -2.92,
+                  "PLTR": -3.48, "SPCX": -4.15},
+        "sectors": {"XLK": -2.10, "XLC": -1.55, "XLY": -1.92, "XLF": -1.08, "XLV": 0.24,
+                    "XLI": -1.21, "XLE": 0.86, "XLB": -0.95, "XLP": 0.41, "XLU": 0.63,
+                    "XLRE": -1.44},
+        "macro": {"^GSPC": (7512, -1.38), "QQQ": (728.40, -1.71), "^VIX": (23.42, 18.6),
+                  "^RUT": (2761, -1.52), "RSP": (205.10, -1.05), "BTC-USD": (81230, -2.80),
+                  "CL=F": (93.40, 1.20), "^TNX": (5.36, None)},
+        "tnx_prev": 5.29,
+    },
+    "panic": {
+        "watch": {"GEV": -1.20, "AAPL": -2.10, "MSFT": -2.35, "WGMI": -2.60, "GOOGL": -2.88,
+                  "META": -3.12, "AMZN": -3.30, "MAGS": -3.55, "IGV": -3.70, "NOW": -4.02,
+                  "AVGO": -4.40, "SOXX": -4.85, "NVDA": -5.12, "TSLA": -5.60, "AMD": -5.95,
+                  "PLTR": -6.70, "SPCX": -8.10},
+        "sectors": {"XLK": -4.35, "XLC": -3.60, "XLY": -3.95, "XLF": -3.12, "XLV": -1.45,
+                    "XLI": -2.88, "XLE": -2.20, "XLB": -2.65, "XLP": -0.92, "XLU": -0.74,
+                    "XLRE": -2.31},
+        "macro": {"^GSPC": (7290, -3.10), "QQQ": (701.25, -3.65), "^VIX": (34.80, 41.2),
+                  "^RUT": (2650, -3.40), "RSP": (199.80, -2.75), "BTC-USD": (76410, -5.10),
+                  "CL=F": (87.60, -3.90), "^TNX": (5.12, None)},
+        "tnx_prev": 5.21,
+    },
+}
+
+
+def demo_data(name: str) -> dict[str, Quote]:
+    d = DEMO[name]
+    quotes: dict[str, Quote] = {}
+    for sym, p in {**d["watch"], **d["sectors"]}.items():
+        price = 100.0
+        quotes[sym] = Quote(sym, price, price / (1 + p / 100))
+    for sym, (price, p) in d["macro"].items():
+        prev = d["tnx_prev"] if sym == "^TNX" else price / (1 + p / 100)
+        quotes[sym] = Quote(sym, price, prev)
+    return quotes
+
+
+# ---------------------------------------------------------------------
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--force", action="store_true", help="בלי בדיקות שעה/יום מסחר")
-    ap.add_argument("--demo", action="store_true", help="נתוני דמו")
-    ap.add_argument("--no-send", action="store_true", help="לא לשלוח לדיסקורד")
+    ap.add_argument("--gate", action="store_true", help="רק לבדוק אם ההרצה המתוזמנת רלוונטית")
+    ap.add_argument("--no-send", action="store_true", help="לשמור תמונה בלי לשלוח לדיסקורד")
+    ap.add_argument("--demo", choices=list(DEMO), help="נתוני דוגמה לתצוגה מקדימה")
+    ap.add_argument("--out", default="market_summary.png")
     args = ap.parse_args()
-    force = args.force or args.demo or os.getenv("FORCE", "").lower() == "true"
-    no_send = args.no_send or os.getenv("NO_SEND", "").lower() == "true"
 
-    now = dt.datetime.now(ET)
-    if not force and not should_run(now):
+    if args.gate:
+        ok = gate()
+        if os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                f.write(f"run={'true' if ok else 'false'}\n")
         return
 
-    cfg = load_config()
-    watch: dict[str, str] = cfg["watch"]
-    market_syms = [t["symbol"] for t in MARKET_TILES]
-
+    out = Path(args.out)
     if args.demo:
-        quotes = demo_quotes()
+        quotes = demo_data(args.demo)
     else:
-        quotes, session = fetch_quotes(list(dict.fromkeys(market_syms + list(watch))), now.date())
-        if session != now.date() and not force:
-            print(f"הבורסה סגורה היום (יום המסחר האחרון: {session}) — מדלג")
+        scheduled = bool(os.environ.get("TRIGGER_SCHEDULE", "").strip())
+        if scheduled and not wait_until_send_time():
             return
 
-    mkt = {s: quotes[s] for s in market_syms if s in quotes}
-    stocks = [Quote(s, quotes[s].price, quotes[s].prev, g) for s, g in watch.items() if s in quotes]
-    if not stocks:
-        sys.exit("לא התקבלו נתונים לאף מניה ברשימה")
+        symbols = list(WATCHLIST) + list(SECTORS) + [m[1] for m in MACRO]
+        print("מושכים נתונים מ-Yahoo Finance...")
+        quotes = fetch_quotes(symbols)
+        if not quotes:
+            sys.exit("❌ לא התקבלו נתונים מ-Yahoo Finance.")
 
-    n = min(5, len(stocks) // 2 or 1)
-    ranked = sorted(stocks, key=lambda s: -s.chg)
-    top, bottom = ranked[:n], sorted(ranked[n:], key=lambda s: s.chg)[:n]
+        today_ny = dt.datetime.now(NY).date()
+        ref = quotes.get("^GSPC") or quotes.get("QQQ")
+        market_open_today = bool(ref and ref.last_date == today_ny)
+        if scheduled:
+            if not market_open_today:
+                print(f"הבורסה בארה\"ב סגורה היום ({today_ny}) – לא שולחים.")
+                return
+            drop_stale(quotes, today_ny)
 
-    headline, tone = build_headline(stocks)
-    spx_chg = mkt["^GSPC"].chg if "^GSPC" in mkt else 0.0
-    ups = sum(s.chg > 0 for s in stocks)
+    render_png(build_html(quotes), out)
+    if not args.no_send:
+        send_to_discord(out)
 
-    ctx = {
-        "mood": mood_for(spx_chg), "headline": headline, "tone": tone,
-        "story": build_story(stocks, mkt),
-        "gainers": {"title": "העולות המובילות" if all(q.chg > 0 for q in top) else "החזקות ברשימה",
-                    "rows": stock_rows(top)},
-        "losers": {"title": "היורדות המובילות" if all(q.chg < 0 for q in bottom) else "החלשות ברשימה",
-                   "rows": stock_rows(bottom)},
-        "breadth": f"{ups}/{len(stocks)}",
-        "alert": vix_alert(mkt), "tiles": build_tiles(mkt),
-        "demo": args.demo,
-    }
-
-    OUT_DIR.mkdir(exist_ok=True)
-    html = render_html(ctx)
-    (OUT_DIR / "last.html").write_text(html, encoding="utf-8")
-    png = OUT_DIR / f"market_{now:%Y-%m-%d}.png"
-    html_to_png(html, png)
-    print(f"🖼️  נשמר: {png}")
-
-    webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
-    if no_send:
-        print("לא נשלח לדיסקורד (בחרת לא לשלוח)")
-        return
-    if not webhook:
-        sys.exit("❌ חסר ה-Secret בשם DISCORD_WEBHOOK_URL ב-GitHub, ולכן התמונה לא נשלחה")
-    plain_title = Markup(headline).striptags()
-    send_discord(webhook, png, f"📊 **{plain_title}**")
-    out = os.getenv("GITHUB_OUTPUT")
-    if out:  # מסמן ל-GitHub שהיום כבר נשלח, כדי לא לשלוח פעמיים
-        with open(out, "a") as f:
-            f.write("sent=true\n")
-
-
-# ───────────────────────────── עיצוב התמונה (HTML) ─────────────────────────────
-
-TEMPLATE = r"""<!doctype html>
-<html lang="he" dir="rtl">
-<head>
-<meta charset="utf-8">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;700;800&display=block" rel="stylesheet">
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --green: #3ad26a; --red: #ff4b4b; --yellow: #ffd21f;
-    --text: #f3f6f5; --muted: #8fa3a0; --line: rgba(255,255,255,.07);
-  }
-  /* צבע רקע לפי מצב ה-S&P 500 */
-  .mood-strong-up   { --bg1:#0b3322; --bg2:#06190f; --panel:rgba(0,0,0,.22); --accent:#3ad26a; }
-  .mood-up          { --bg1:#113130; --bg2:#0a1e1d; --panel:rgba(0,0,0,.20); --accent:#5fd4a0; }
-  .mood-flat        { --bg1:#18222c; --bg2:#0e151c; --panel:rgba(0,0,0,.22); --accent:#9fb3c8; }
-  .mood-down        { --bg1:#301a1c; --bg2:#1a0d0f; --panel:rgba(0,0,0,.22); --accent:#ff7a6b; }
-  .mood-strong-down { --bg1:#40121a; --bg2:#1f070b; --panel:rgba(0,0,0,.26); --accent:#ff4b4b; }
-
-  body { background: #000; font-family: "Heebo", "FreeSans", "DejaVu Sans", sans-serif; }
-  #card {
-    width: 1080px; min-height: 1350px; padding: 36px 28px 0;
-    background: linear-gradient(180deg, var(--bg1) 0%, var(--bg2) 100%);
-    color: var(--text); display: flex; flex-direction: column; gap: 20px;
-    font-variant-numeric: tabular-nums;
-  }
-  .tk { unicode-bidi: isolate; direction: ltr; }
-
-
-  .kicker { display: flex; justify-content: space-between; padding: 0 12px; margin-top: 0;
-            color: var(--muted); font-size: 17px; font-weight: 700; }
-  .kicker .breadth b { color: var(--text); }
-  h1 { font-size: 50px; font-weight: 800; line-height: 1.12; padding: 0 12px; margin-top: -10px; letter-spacing: -.5px; }
-  h1 .hl { color: var(--hl); }
-  .tone-up { --hl: var(--green); } .tone-down { --hl: var(--red); } .tone-flat { --hl: var(--accent); }
-
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 22px; }
-  .story { padding: 26px 32px; font-size: 29px; line-height: 1.6; font-weight: 400; }
-  .story .tk { font-weight: 500; }
-
-  .lists { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  .list { padding: 20px 20px 8px; }
-  .list h2 { font-size: 25px; font-weight: 800; display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
-  .list h2::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--dot); }
-  .list.gain { --dot: var(--green); } .list.lose { --dot: var(--red); }
-  .row { display: flex; justify-content: space-between; align-items: center; height: 64px; border-bottom: 1px solid var(--line); }
-  .row:last-child { border-bottom: 0; }
-  .row .name { display: flex; align-items: baseline; gap: 12px; }
-  .row .sym { font-size: 32px; font-weight: 800; direction: ltr; }
-  .row .grp { font-size: 16px; color: var(--muted); font-weight: 500; }
-  .row .chg { font-size: 32px; font-weight: 800; direction: ltr; }
-
-  .up { color: var(--green); } .down { color: var(--red); } .flat { color: var(--muted); }
-
-  .alert { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 4px;
-           padding: 18px 26px; font-size: 24px; font-weight: 700; border-radius: 16px; }
-  .alert .ttl { font-size: 32px; font-weight: 800; direction: ltr; }
-  .alert.danger .line.first { font-size: 30px; font-weight: 800; }
-  .alert.warn   { background: rgba(255,210,31,.08); border: 1px solid rgba(255,210,31,.28); color: var(--yellow); }
-  .alert.danger { background: rgba(255,75,75,.10);  border: 1px solid rgba(255,75,75,.35);  color: #ff8080; }
-  .alert.calm   { background: rgba(58,210,106,.07); border: 1px solid rgba(58,210,106,.25); color: #7fe0a0; }
-
-  .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; direction: ltr; }
-  .tile { padding: 18px 10px 16px; text-align: center; border-radius: 18px; }
-  .tile .lbl { font-size: 22px; font-weight: 800; letter-spacing: .3px; }
-  .tile .sub { font-size: 16px; color: var(--muted); font-weight: 500; }
-  .tile .val { font-size: 40px; font-weight: 800; margin-top: 6px; letter-spacing: -.5px; }
-  .tile .val.warn { color: var(--yellow); } .tile .val.danger { color: var(--red); }
-  .tile .chg { font-size: 24px; font-weight: 800; margin-top: 4px; }
-
-  footer { margin: auto -28px 0; padding: 22px 40px; border-top: 1px solid var(--line);
-           display: flex; justify-content: flex-end; align-items: center; }
-  footer .src.demo { color: var(--yellow); opacity: 1; font-size: 18px; direction: rtl; }
-  footer .src { color: var(--muted); font-size: 15px; font-weight: 700; opacity: .7; direction: ltr; }
-</style>
-</head>
-<body>
-<div id="card" class="mood-{{ mood }}">
-
-
-  <div class="kicker">
-    <span>הסיפור של היום</span>
-    <span class="breadth">עולות ברשימה: <b class="tk">{{ breadth }}</b></span>
-  </div>
-  <h1 class="tone-{{ tone }}">{{ headline }}</h1>
-
-  <div class="panel story">{{ story }}</div>
-
-  <div class="lists">
-    {% for key, cls in [("gainers", "gain"), ("losers", "lose")] %}
-    {% set box = gainers if key == "gainers" else losers %}
-    <div class="panel list {{ cls }}">
-      <h2>{{ box.title }}</h2>
-      {% for r in box.rows %}
-      <div class="row">
-        <div class="name"><span class="sym">{{ r.symbol }}</span>{% if r.group %}<span class="grp">{{ r.group }}</span>{% endif %}</div>
-        <div class="chg {{ r.cls }}">{{ r.change }}</div>
-      </div>
-      {% endfor %}
-    </div>
-    {% endfor %}
-  </div>
-
-  {% if alert %}
-  <div class="alert {{ alert.level }}">
-    {% if alert.title %}<div class="ttl">{{ alert.title }}</div>{% endif %}
-    {% for line in alert.lines %}<div class="line{% if loop.first %} first{% endif %}">{{ line }}</div>{% endfor %}
-  </div>
-  {% endif %}
-
-  <div class="tiles">
-    {% for t in tiles %}
-    <div class="panel tile">
-      <div class="lbl">{{ t.label }}{% if t.sub %} <span class="sub" dir="rtl">{{ t.sub }}</span>{% endif %}</div>
-      <div class="val {{ t.value_cls }}">{{ t.value }}</div>
-      <div class="chg {{ t.cls }}">{{ t.change }}</div>
-    </div>
-    {% endfor %}
-  </div>
-
-  <footer>
-    {% if demo %}<div class="src demo">נתוני דמו, לא אמיתיים</div>{% else %}<div class="src">DATA: YAHOO FINANCE</div>{% endif %}
-  </footer>
-</div>
-</body>
-</html>
-"""
 
 if __name__ == "__main__":
     main()

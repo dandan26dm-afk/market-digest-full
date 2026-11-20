@@ -140,14 +140,17 @@ def gate() -> bool:
     return False
 
 
-def wait_until_send_time() -> bool:
+def env_true(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() == "true"
+
+
+def in_send_window() -> bool:
+    """ה-workflow מתעורר כמה פעמים. שולחים רק מ-17:00 שעון ישראל ועד 3 שעות אחרי."""
     now = dt.datetime.now(IL)
     target = now.replace(hour=SEND_HOUR_IL, minute=SEND_MINUTE_IL, second=0, microsecond=0)
-    if now < target:
-        secs = (target - now).total_seconds()
-        print(f"ממתינים {secs / 60:.1f} דקות עד {target:%H:%M} שעון ישראל...")
-        time.sleep(secs)
-        return True
+    if now < target - dt.timedelta(minutes=3):
+        print(f"עכשיו {now:%H:%M} שעון ישראל – מוקדם מדי, מדלגים (ההרצה של 17:00 תשלח).")
+        return False
     late_h = (now - target).total_seconds() / 3600
     if late_h > MAX_LATE_HOURS:
         print(f"GitHub איחר ב-{late_h:.1f} שעות – לא שולחים היום.")
@@ -390,7 +393,12 @@ def build_html(quotes: dict[str, Quote]) -> str:
     all_neg = bottom and all(p < 0 for _, p in bottom)
     sectors_html, sectors_summary = sector_tiles(quotes)
 
-    tpl = Template((BASE_DIR / "template.html").read_text(encoding="utf-8"))
+    tpl_path = next((c for c in (BASE_DIR / "templates" / "digest",
+                                 BASE_DIR / "templates" / "digest.html",
+                                 BASE_DIR / "template.html") if c.is_file()), None)
+    if tpl_path is None:
+        sys.exit("❌ לא נמצא קובץ העיצוב (templates/digest).")
+    tpl = Template(tpl_path.read_text(encoding="utf-8"))
     return tpl.safe_substitute(
         font_css=font_css(),
         mood=mood,
@@ -518,7 +526,7 @@ def main() -> None:
     ap.add_argument("--gate", action="store_true", help="רק לבדוק אם ההרצה המתוזמנת רלוונטית")
     ap.add_argument("--no-send", action="store_true", help="לשמור תמונה בלי לשלוח לדיסקורד")
     ap.add_argument("--demo", choices=list(DEMO), help="נתוני דוגמה לתצוגה מקדימה")
-    ap.add_argument("--out", default="market_summary.png")
+    ap.add_argument("--out", default="out/market_digest.png")
     args = ap.parse_args()
 
     if args.gate:
@@ -529,11 +537,15 @@ def main() -> None:
         return
 
     out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    no_send = args.no_send or env_true("NO_SEND")
     if args.demo:
         quotes = demo_data(args.demo)
     else:
-        scheduled = bool(os.environ.get("TRIGGER_SCHEDULE", "").strip())
-        if scheduled and not wait_until_send_time():
+        # הרצה רגילה (מתוזמנת או טריגר חיצוני): בודקים שעה וחג.
+        # הרצה ידנית עם "להריץ גם מחוץ לשעות" (FORCE) מדלגת על הבדיקות.
+        scheduled = not env_true("FORCE")
+        if scheduled and not in_send_window():
             return
 
         symbols = list(WATCHLIST) + list(SECTORS) + [m[1] for m in MACRO]
@@ -552,8 +564,11 @@ def main() -> None:
             drop_stale(quotes, today_ny)
 
     render_png(build_html(quotes), out)
-    if not args.no_send:
+    if not no_send:
         send_to_discord(out)
+        if os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                f.write("sent=true\n")
 
 
 if __name__ == "__main__":

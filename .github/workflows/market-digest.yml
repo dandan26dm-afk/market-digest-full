@@ -39,7 +39,7 @@ jobs:
       - name: Already sent today?
         id: sent
         if: ${{ !inputs.force }}
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .sent
           key: sent-${{ steps.date.outputs.today }}
@@ -51,16 +51,18 @@ jobs:
     runs-on: ubuntu-24.04   # גרסה קבועה, כדי שהמעבר של GitHub ל-Ubuntu 26 לא ישבור את ההרצה
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
 
       - name: Install
         run: |
-          pip install -r requirements.txt
+          pip install -U -r requirements.txt
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-color-emoji
           python -m playwright install --with-deps chromium
 
       - name: Build image & send to Discord
@@ -77,14 +79,14 @@ jobs:
 
       - name: Remember (no double send)
         if: ${{ steps.run.outputs.sent == 'true' && !inputs.force }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .sent
           key: sent-${{ needs.check.outputs.today }}
 
       - name: Save image as artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: market-digest
           path: out/*.png
